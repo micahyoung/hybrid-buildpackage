@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"github.com/buildpacks/imgutil/layer"
@@ -15,6 +16,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
+	"github.com/paketo-buildpacks/packit/cargo"
 	"io"
 	"log"
 	"os"
@@ -134,12 +136,12 @@ func run(imageName string, publish bool) error {
 	if err := hybridWriter.WriteHeader(&tar.Header{
 		Name:     "Files/cnb/buildpacks/hybrid/0.0.1/buildpack.toml",
 		Typeflag: tar.TypeReg,
-		Size: int64(len(buildpackTomlContent)),
+		Size:     int64(len(buildpackTomlContent)),
 		Mode:     linuxReadMode,
 		PAXRecords: map[string]string{
 			"MSWINDOWS.rawsd": windowsReadSecurityDescriptor,
 		},
-		Format:   tar.FormatPAX,
+		Format: tar.FormatPAX,
 	}); err != nil {
 		return err
 	}
@@ -156,7 +158,7 @@ func run(imageName string, publish bool) error {
 		PAXRecords: map[string]string{
 			"MSWINDOWS.rawsd": windowsReadSecurityDescriptor,
 		},
-		Format:   tar.FormatPAX,
+		Format: tar.FormatPAX,
 	}); err != nil {
 		return err
 	}
@@ -166,11 +168,11 @@ func run(imageName string, publish bool) error {
 	if err := hybridWriter.WriteHeader(&tar.Header{
 		Name:     "Files/cnb/buildpacks/hybrid/0.0.1/bin/detect.bat",
 		Typeflag: tar.TypeReg,
-		Size: int64(len(detectBatContent)),
+		Size:     int64(len(detectBatContent)),
 		PAXRecords: map[string]string{
 			"MSWINDOWS.rawsd": windowsReadSecurityDescriptor,
 		},
-		Format:   tar.FormatPAX,
+		Format: tar.FormatPAX,
 	}); err != nil {
 		return err
 	}
@@ -180,11 +182,11 @@ func run(imageName string, publish bool) error {
 	if err := hybridWriter.WriteHeader(&tar.Header{
 		Name:     "Files/cnb/buildpacks/hybrid/0.0.1/bin/build.bat",
 		Typeflag: tar.TypeReg,
-		Size: int64(len(buildBatContent)),
+		Size:     int64(len(buildBatContent)),
 		PAXRecords: map[string]string{
 			"MSWINDOWS.rawsd": windowsReadSecurityDescriptor,
 		},
-		Format:   tar.FormatPAX,
+		Format: tar.FormatPAX,
 	}); err != nil {
 		return err
 	}
@@ -197,7 +199,7 @@ func run(imageName string, publish bool) error {
 	if err := hybridWriter.WriteHeader(&tar.Header{
 		Name:     "Files/cnb/buildpacks/hybrid/0.0.1/bin/detect",
 		Typeflag: tar.TypeReg,
-		Size: int64(len(detectShContent)),
+		Size:     int64(len(detectShContent)),
 		Mode:     linuxReadMode,
 	}); err != nil {
 		return err
@@ -209,7 +211,7 @@ func run(imageName string, publish bool) error {
 	if err := hybridWriter.WriteHeader(&tar.Header{
 		Name:     "Files/cnb/buildpacks/hybrid/0.0.1/bin/build",
 		Typeflag: tar.TypeReg,
-		Size: int64(len(buildShContent)),
+		Size:     int64(len(buildShContent)),
 		Mode:     linuxReadMode,
 	}); err != nil {
 		return err
@@ -253,23 +255,57 @@ func run(imageName string, publish bool) error {
 		return err
 	}
 
+	// generate image LABEL layer metadata
+	buildpackConfig := &cargo.Config{}
+	if err := cargo.DecodeConfig(bytes.NewBufferString(buildpackTomlContent), buildpackConfig); err != nil {
+		return err
+	}
+
 	sum := sha256.Sum256(hybridLayerBlob.Bytes())
 	shasum := fmt.Sprintf("sha256:%x", sum)
 
-	fmt.Println("building new image")
-	image, err := mutate.ConfigFile(empty.Image, &v1.ConfigFile{
-		Config: v1.Config{
-			Labels: map[string]string{
-				"io.buildpacks.buildpack.layers":      `{"hybrid":{"0.0.1":{"api":"0.2","stacks":[{"id":"io.buildpacks.samples.stacks.alpine"},{"id":"io.buildpacks.samples.stacks.nanoserver-1809"}],"layerDiffID":"` + shasum + `"}}}`,
-				"io.buildpacks.buildpackage.metadata": `{"id":"hybrid","version":"0.0.1","stacks":[{"id":"io.buildpacks.samples.stacks.alpine"},{"id":"io.buildpacks.samples.stacks.nanoserver-1809"}]}`,
+	layerConfig := map[string]map[string]struct {
+		Api         string      `json:"api"`
+		Stacks      interface{} `json:"stacks"`
+		LayerDiffID string      `json:"layerDiffID"`
+	}{
+		buildpackConfig.Buildpack.ID: {
+			buildpackConfig.Buildpack.Version: {
+				buildpackConfig.API,
+				buildpackConfig.Stacks,
+				shasum,
 			},
 		},
-	})
+	}
+
+	layerMetadata := struct {
+		ID      string      `json:"id"`
+		Version string      `json:"version"`
+		Stacks  interface{} `json:"stacks"`
+	}{
+		buildpackConfig.Buildpack.ID,
+		buildpackConfig.Buildpack.Version,
+		buildpackConfig.Stacks,
+	}
+
+	layerConfigJSON, err := json.Marshal(layerConfig)
+	if err != nil {
+		return err
+	}
+	layerMetadataJSON, err := json.Marshal(layerMetadata)
 	if err != nil {
 		return err
 	}
 
-	hybridLayer, err := tarball.LayerFromReader(hybridLayerBlob)
+	// initialize image with config
+	image, err := mutate.ConfigFile(empty.Image, &v1.ConfigFile{
+		Config: v1.Config{
+			Labels: map[string]string{
+				"io.buildpacks.buildpack.layers":      string(layerConfigJSON),
+				"io.buildpacks.buildpackage.metadata": string(layerMetadataJSON),
+			},
+		},
+	})
 	if err != nil {
 		return err
 	}
@@ -281,6 +317,12 @@ func run(imageName string, publish bool) error {
 	}
 
 	windowsScratchBaseLayer, err := tarball.LayerFromReader(windowsBaseLayerReader)
+	if err != nil {
+		return err
+	}
+
+	// generate hybrid layer
+	hybridLayer, err := tarball.LayerFromReader(hybridLayerBlob)
 	if err != nil {
 		return err
 	}
